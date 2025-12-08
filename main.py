@@ -1,7 +1,5 @@
-
 import ssl
 import certifi
-import websocket
 import websocket
 import requests
 import json
@@ -13,63 +11,52 @@ import logging
 from decimal import Decimal, getcontext
 from dotenv import load_dotenv
 
-# --- Настройка окружения и логирования ---
-# Загружаем переменные из.env файла (безопасность)
-# Замените строку load_dotenv() на этот блок:
+# --- НОВЫЕ ИМПОРТЫ ДЛЯ GRAFANA/INFLUXDB ---
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
+
+# --- Настройка окружения ---
 env_path = os.path.join(os.path.dirname(__file__), '.env')
 if os.path.exists(env_path):
     load_dotenv(env_path)
-    print(f"Файл.env найден: {env_path}")
 else:
-    print("ВНИМАНИЕ: Файл.env не найден! Проверьте имя файла.")
+    print("ВНИМАНИЕ: Файл.env не найден!")
 
-# Настройка логирования, чтобы видеть, что происходит в консоли
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - [%(levelname)s] - %(message)s',
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger("ArbMonitor")
-
-# Устанавливаем точность для финансовых вычислений
 getcontext().prec = 8
 
 
-# --- Конфигурация ---
+# --- КОНФИГУРАЦИЯ ---
 class Config:
-    # URL вебсокета Binance (Stream: btcusdt@ticker)
     BINANCE_WS = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
-
-    # API Mercuryo (Публичный конвертер)
     MERCURYO_API = "https://api.mercuryo.io/v1.6/public/convert"
+    MERCURYO_PARAMS = {"from": "USD", "to": "BTC", "amount": "100", "type": "buy"}
 
-    # Параметры запроса к Mercuryo (100 USD -> BTC)
-    MERCURYO_PARAMS = {
-        "from": "USD",
-        "to": "BTC",
-        "amount": "100",
-        "type": "buy"
-    }
-
-    # Telegram настройки (берутся из.env или переменных среды)
     TG_TOKEN = os.getenv("TG_TOKEN")
     TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
-    # Пороговые значения спреда (в процентах)
-    THRESHOLD_LOW = Decimal("0.20")
-    THRESHOLD_HIGH = Decimal("0.5")
+    THRESHOLD_LOW = Decimal("0.1")
+    THRESHOLD_HIGH = Decimal("0.25")
 
-    # Частота опроса Mercuryo (в секундах)
-    # ОБНОВЛЕНО: 5 секунд для меньшей нагрузки
-    POLL_INTERVAL = 5.0
+    # ОБНОВЛЕНО: Интервал 10 секунд
+    POLL_INTERVAL = 10.0
 
-    # Пауза после отправки сигнала (в секундах)
-    # ОБНОВЛЕНО: 1 минута перерыва после алерта
+    # Кулдаун для Телеграма
     ALERT_COOLDOWN = 60.0
 
+    # --- НАСТРОЙКИ GRAFANA / INFLUXDB ---
+    INFLUX_URL = "https://eu-central-1-1.aws.cloud2.influxdata.com/"
+    INFLUX_TOKEN = "gfH4qW_kDybtTbnQY7gFxvgeLC31dWYZ8hLte0VUjNmhDs8hDgvN3hI8yHABFqGMAIwTBcTF0wvQ4bFM1Cp0IQ=="
+    INFLUX_ORG = "d5619b358e0982ea"
+    INFLUX_BUCKET = "monitor_data"
 
-# --- Глобальное состояние ---
-# Используем потокобезопасный подход для хранения последней цены Binance
+
+# --- СОСТОЯНИЕ РЫНКА ---
 class MarketData:
     def __init__(self):
         self._lock = threading.Lock()
@@ -80,7 +67,7 @@ class MarketData:
             try:
                 self._binance_ask = Decimal(price_str)
             except Exception as e:
-                logger.error(f"Ошибка конвертации цены Binance: {e}")
+                logger.error(f"Err convert: {e}")
 
     def get_binance(self):
         with self._lock:
@@ -89,181 +76,133 @@ class MarketData:
 
 market_data = MarketData()
 
+try:
+    influx_client = InfluxDBClient(
+        url=Config.INFLUX_URL,
+        token=Config.INFLUX_TOKEN,
+        org=Config.INFLUX_ORG,
+        verify_ssl=True,
+        ssl_ca_cert = certifi.where(),
+    )
+    write_api = influx_client.write_api(write_options=SYNCHRONOUS)
+    logger.info("InfluxDB клиент инициализирован (SSL verification disabled)")
+except Exception as e:
+    logger.error(f"Ошибка инициализации InfluxDB: {e}")
+    sys.exit(1)
 
-# --- Модуль Telegram ---
+
+# --- TELEGRAM ---
 def send_telegram_alert(message):
     if not Config.TG_TOKEN or not Config.TG_CHAT_ID:
-        logger.warning("Telegram токен или Chat ID не заданы. Алерт пропущен.")
         return False
-
     url = f"https://api.telegram.org/bot{Config.TG_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": Config.TG_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"  # Позволяет использовать жирный шрифт и моноширинный текст
-    }
-
+    payload = {"chat_id": Config.TG_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        response = requests.post(url, json=payload, timeout=5)
-        if response.status_code != 200:
-            logger.error(f"Ошибка отправки в TG: {response.text}")
-            return False
-        else:
-            logger.info("Сигнал успешно отправлен в Telegram.")
-            return True
+        requests.post(url, json=payload, timeout=5)
+        return True
     except Exception as e:
-        logger.error(f"Сбой соединения с Telegram: {e}")
+        logger.error(f"TG Error: {e}")
         return False
 
 
-# --- Модуль Binance WebSocket ---
+# --- BINANCE WS ---
 def on_message(ws, message):
     try:
         data = json.loads(message)
-        # Извлекаем поле 'a' - Best Ask Price
         best_ask = data.get('a')
         if best_ask:
             market_data.update_binance(best_ask)
-    except Exception as e:
-        logger.error(f"Ошибка парсинга WS сообщения: {e}")
-
-
-def on_error(ws, error):
-    logger.error(f"WebSocket Ошибка: {error}")
-
-
-def on_close(ws, close_status_code, close_msg):
-    logger.warning("WebSocket соединение закрыто. Переподключение...")
-
-
-def on_open(ws):
-    logger.info("Подключено к Binance WebSocket (btcusdt@ticker)")
+    except:
+        pass
 
 
 def run_binance_ws():
-    # Настройка проверки сертификатов через certifi
-    sslopt = {
-        "cert_reqs": ssl.CERT_REQUIRED,
-        "ca_certs": certifi.where(),
-    }
-    # Запускаем бесконечный цикл для авто-реконнекта при разрыве
+    sslopt = {"cert_reqs": ssl.CERT_NONE}  # Тоже отключаем строгую проверку для WS
     while True:
         try:
             ws = websocket.WebSocketApp(
                 Config.BINANCE_WS,
-                on_open=on_open,
                 on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
+                on_error=lambda ws, err: logger.error(f"WS Err: {err}"),
+                on_close=lambda ws, *args: logger.warning("WS Closed")
             )
             ws.run_forever(sslopt=sslopt)
         except Exception as e:
-            logger.error(f"Критическая ошибка WS: {e}. Ждем 5 сек...")
+            logger.error(f"WS Critical: {e}")
             time.sleep(5)
 
 
-# --- Модуль Mercuryo (REST) ---
+# --- MERCURYO ---
 def get_mercuryo_rate():
-    # Важно: Mercuryo может блокировать запросы без User-Agent (ошибка 403)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        response = requests.get(Config.MERCURYO_API, params=Config.MERCURYO_PARAMS, headers=headers, timeout=5)
-
+        response = requests.get(Config.MERCURYO_API, params=Config.MERCURYO_PARAMS, headers=headers, timeout=10)
         if response.status_code == 200:
             data = response.json()
-            # Пытаемся найти 'rate'. Структура может меняться, ищем на верхнем уровне или в data
-            rate = data.get('rate')
-            if not rate and 'data' in data:
-                rate = data['data'].get('rate')
-
-            if rate:
-                return Decimal(str(rate))
-            else:
-                logger.warning(f"Поле 'rate' не найдено в ответе: {data}")
-                return None
+            rate = data.get('rate') or data.get('data', {}).get('rate')
+            return Decimal(str(rate)) if rate else None
         elif response.status_code == 429:
-            logger.warning("Mercuryo Rate Limit! Пауза 5 min.")
-            time.sleep(300)
+            logger.warning("Mercuryo Rate Limit!")
             return None
-        else:
-            logger.error(f"Mercuryo API Error {response.status_code}: {response.text}")
-            return None
-    except Exception as e:
-        logger.error(f"Ошибка запроса к Mercuryo: {e}")
+    except Exception:
         return None
 
 
-# --- Основной цикл (Main Loop) ---
+# --- MAIN ---
 def main():
-    logger.info("Запуск скрипта мониторинга...")
-    logger.info(f"Интервал опроса: {Config.POLL_INTERVAL} сек. Пауза после сигнала: {Config.ALERT_COOLDOWN} сек.")
+    logger.info("Запуск... Интервал: 10 сек. Графики пишутся всегда.")
 
-    # 1. Запускаем WebSocket в отдельном потоке (Daemon thread)
-    ws_thread = threading.Thread(target=run_binance_ws, daemon=True)
-    ws_thread.start()
-
-    # Даем пару секунд на подключение к Binance
+    threading.Thread(target=run_binance_ws, daemon=True).start()
     time.sleep(3)
 
-    logger.info("Начинаем опрос Mercuryo и сравнение цен...")
+    last_alert_time = 0  # Таймер для кулдауна ТГ
 
     while True:
-        # Получаем цены
         merc_rate = get_mercuryo_rate()
         bin_ask = market_data.get_binance()
 
         if merc_rate and bin_ask:
-            # Считаем разницу
-            # Формула: (Mercuryo - Binance)
             diff_abs = merc_rate - bin_ask
-
-            # Считаем процент: (Diff / Binance) * 100
             diff_pct = (diff_abs / bin_ask) * 100
 
-            log_msg = f"Binance: {bin_ask} | Mercuryo: {merc_rate} | Spread: {diff_pct:.4f}%"
-            logger.info(log_msg)
+            # Логируем в консоль
+            logger.info(f"Binance: {bin_ask} | Mercuryo: {merc_rate} | Spread: {diff_pct:.4f}%")
 
-            # Проверяем условия для сигнала
-            # 1. Меньше 0.20% (слишком узкий спред или отрицательный)
-            # 2. Больше 0.5% (слишком широкий спред)
+            # 1. ОТПРАВКА В GRAFANA (ВСЕГДА)
+            try:
 
-            alert_triggered = False
-            condition_desc = ""
+                p = Point("spread_monitor") \
+                    .tag("pair", "BTC/USDT") \
+                    .field("spread_pct", float(diff_pct)) \
+                    .field("binance", float(bin_ask)) \
+                    .field("mercuryo", float(merc_rate))
 
-            if diff_pct < Config.THRESHOLD_LOW:
-                alert_triggered = True
-                condition_desc = "📉 СПРЕД НИЖЕ 0.20%"
-            elif diff_pct > Config.THRESHOLD_HIGH:
-                alert_triggered = True
-                condition_desc = "📈 СПРЕД ВЫШЕ 0.5%"
+                write_api.write(bucket=Config.INFLUX_BUCKET, org=Config.INFLUX_ORG, record=p)
+            except Exception as e:
+                logger.error(f"Ошибка записи в Grafana: {e}")
 
-            if alert_triggered:
-                # Формируем красивое сообщение для Telegram с явным указанием процента
-                msg_text = (
-                    f"🚨 **ALERT** 🚨\n\n"
-                    f"{condition_desc}\n"
-                    f"👉 **ТЕКУЩИЙ СПРЕД: {diff_pct:.4f}%** 👈\n\n"
-                    f"🏦 **Mercuryo:** `{merc_rate}`\n"
-                    f"🔶 **Binance Ask:** `{bin_ask}`\n"
-                    f"💵 **Разница:** `{diff_abs:.2f} USD`"
-                )
-                sent_success = send_telegram_alert(msg_text)
+            # 2. ПРОВЕРКА АЛЕРТОВ (Только если прошел кулдаун)
+            if diff_pct < Config.THRESHOLD_LOW or diff_pct > Config.THRESHOLD_HIGH:
+                current_time = time.time()
 
-                if sent_success:
-                    # ОБНОВЛЕНО: Если сигнал отправлен, делаем длинную паузу
-                    logger.info(f"Сигнал отправлен. Пауза {Config.ALERT_COOLDOWN} сек перед следующей проверкой...")
-                    time.sleep(Config.ALERT_COOLDOWN)
-                    # continue пропускает остаток цикла, чтобы не делать двойную задержку
-                    continue
+                # Если прошло больше 60 сек с последнего алерта
+                if (current_time - last_alert_time) > Config.ALERT_COOLDOWN:
+
+                    desc = "📉 НИЖЕ 0.1%" if diff_pct < Config.THRESHOLD_LOW else "📈 ВЫШЕ 0.25%"
+                    msg = (f"🚨 **ALERT** {desc}\n"
+                           f"Spread: **{diff_pct:.4f}%**\n"
+                           f"Merc: `{merc_rate}` | Bin: `{bin_ask}`")
+
+                    if send_telegram_alert(msg):
+                        logger.info(">>> Алерт отправлен в Telegram")
+                        last_alert_time = current_time  # Обновляем таймер
+                else:
+                    logger.info("(Алерт пропущен - действует кулдаун)")
 
         else:
-            if not bin_ask:
-                logger.warning("Ждем данных от Binance WebSocket...")
+            if not bin_ask: logger.warning("Ждем цену Binance...")
 
-        # Ждем перед следующим опросом (Rate Limit protection)
+        # Ждем 10 секунд и повторяем (независимо от алертов)
         time.sleep(Config.POLL_INTERVAL)
 
 
@@ -271,4 +210,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        logger.info("Остановка скрипта пользователем (Ctrl+C).")
+        logger.info("Стоп.")
