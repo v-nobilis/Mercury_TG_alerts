@@ -40,8 +40,8 @@ class Config:
     TG_TOKEN = os.getenv("TG_TOKEN")
     TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
-    THRESHOLD_LOW = Decimal("0.1")
-    THRESHOLD_HIGH = Decimal("0.25")
+    THRESHOLD_LOW = Decimal("0.05")
+    THRESHOLD_HIGH = Decimal("0.4")
 
     # ОБНОВЛЕНО: Интервал 10 секунд
     POLL_INTERVAL = 10.0
@@ -96,7 +96,7 @@ def send_telegram_alert(message):
     if not Config.TG_TOKEN or not Config.TG_CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{Config.TG_TOKEN}/sendMessage"
-    payload = {"chat_id": Config.TG_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {"chat_id": Config.TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         requests.post(url, json=payload, timeout=5)
         return True
@@ -110,26 +110,37 @@ def on_message(ws, message):
     try:
         data = json.loads(message)
         best_ask = data.get('a')
+
         if best_ask:
-            market_data.update_binance(best_ask)
-    except:
-        pass
+            price_final = round(float(best_ask), 2)
+            market_data.update_binance(price_final)
+
+
+    except Exception as e:
+        logger.error(f"Error parsing Binance msg: {e}")
 
 
 def run_binance_ws():
-    sslopt = {"cert_reqs": ssl.CERT_NONE}  # Тоже отключаем строгую проверку для WS
+    sslopt = {"cert_reqs": ssl.CERT_NONE}
+
     while True:
         try:
+            logger.info("Connecting to Binance WS...")
             ws = websocket.WebSocketApp(
                 Config.BINANCE_WS,
                 on_message=on_message,
                 on_error=lambda ws, err: logger.error(f"WS Err: {err}"),
                 on_close=lambda ws, *args: logger.warning("WS Closed")
             )
-            ws.run_forever(sslopt=sslopt)
+
+            ws.run_forever(
+                sslopt=sslopt,
+                ping_interval=20,
+                ping_timeout=10
+            )
         except Exception as e:
             logger.error(f"WS Critical: {e}")
-            time.sleep(5)
+            time.sleep(5)  # Пауза перед реконнектом
 
 
 # --- MERCURYO ---
@@ -166,7 +177,7 @@ def main():
             diff_pct = (diff_abs / bin_ask) * 100
 
             # Логируем в консоль
-            logger.info(f"Binance: {bin_ask} | Mercuryo: {merc_rate} | Spread: {diff_pct:.4f}%")
+            logger.info(f"Binance: {bin_ask:.2f} | Mercuryo: {merc_rate} | Spread: {diff_pct:.4f}%")
 
             # 1. ОТПРАВКА В GRAFANA (ВСЕГДА)
             try:
@@ -181,21 +192,39 @@ def main():
             except Exception as e:
                 logger.error(f"Ошибка записи в Grafana: {e}")
 
-            # 2. ПРОВЕРКА АЛЕРТОВ (Только если прошел кулдаун)
             if diff_pct < Config.THRESHOLD_LOW or diff_pct > Config.THRESHOLD_HIGH:
                 current_time = time.time()
 
-                # Если прошло больше 60 сек с последнего алерта
                 if (current_time - last_alert_time) > Config.ALERT_COOLDOWN:
 
-                    desc = "📉 НИЖЕ 0.1%" if diff_pct < Config.THRESHOLD_LOW else "📈 ВЫШЕ 0.25%"
-                    msg = (f"🚨 **ALERT** {desc}\n"
-                           f"Spread: **{diff_pct:.4f}%**\n"
-                           f"Merc: `{merc_rate}` | Bin: `{bin_ask}`")
+                    # Используем СТАНДАРТНЫЕ эмодзи (работают у всех ботов)
+                    ICON_ALERT = "🚨"
+                    ICON_LOW   = "📉"
+                    ICON_HIGH  = "📈"
+                    ICON_BIN   = "🔶"  # Оранжевый ромб (Binance)
+                    ICON_MERC  = "Ⓜ️"  # Буква М (Mercuryo)
+
+                    # Определяем текст и картинку
+                    if diff_pct < Config.THRESHOLD_LOW:
+                        status_emoji = ICON_LOW
+                        desc = "НИЖЕ 0.05%"
+                    else:
+                        status_emoji = ICON_HIGH
+                        desc = "ВЫШЕ 0.4%"
+
+                    # Формируем HTML сообщение
+                    # Теги <tg-emoji> убираем, так как они не работают у обычных ботов
+                    msg = (
+                        f"{ICON_ALERT} <b>ALERT</b> {status_emoji} {desc}\n"
+                        f"Spread: <b>{diff_pct:.4f}%</b>\n"
+                        f"{ICON_MERC} <code>{merc_rate:.2f}</code> | "
+                        f"{ICON_BIN} <code>{bin_ask:.2f}</code>"
+                    )
 
                     if send_telegram_alert(msg):
                         logger.info(">>> Алерт отправлен в Telegram")
-                        last_alert_time = current_time  # Обновляем таймер
+                        last_alert_time = current_time
+
                 else:
                     logger.info("(Алерт пропущен - действует кулдаун)")
 
